@@ -67,10 +67,12 @@ function iterate(it::AARIterable, iteration::Int=start(it))
 	F = reduce(hcat, it.F)
 	X = reduce(hcat, it.X)
 	FT = transpose(F)
-	#QR = qr(F) 
-	#RT = transpose(QR.R)
-	B = (X + it.beta * F) * inv(FT * F) * FT
-        it.u .= it.u + it.beta * it.r - B * it.r
+	QR = qr(F) 
+	RT = transpose(QR.R)
+	Q = Matrix(QR.Q)
+	#alphas = QR \ it.r
+	B = (X + it.beta * F) * inv(RT * QR.R) * FT
+	it.u .= it.u + it.beta * it.r - B * it.r
     end
 
     # Update X matrix
