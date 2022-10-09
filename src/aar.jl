@@ -1,11 +1,13 @@
 import Base: iterate
 using Printf
 using LinearAlgebra:norm
-using TimerOutputs
+#using TimerOutputs
 export aar, aar!, AARIterable, aar_iterator!, AARStateVariables
 
 mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     A::matT
+    Q::Matrix # Dense, so we hard-code the type
+    R::Matrix # Dense, so we hard-code the type
     x::solT
     b::vecT
     Pl::preclT
@@ -13,10 +15,12 @@ mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     r::vecT
     u::vecT
     work::vecT
+    work2::vecT
+    work_depth::vecT
+    weights::vecT
     r_prev::vecT
     u_prev::solT
-    F::Vector{vecT}
-    X::Vector{vecT}
+    FbX::Matrix # Dense matrix containing X + beta F
     tol::numT
     residual::numT
     prev_residual::numT
@@ -26,7 +30,47 @@ mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     p::Int
     omega::Real
     beta::Real
+    first_FX_index::Int
 end
+
+# Note: x does not change
+function append_column!(Q::Matrix, R::Matrix, x::Vector, work::Vector, work_depth::Vector, position::Int)
+    mul!(work, Q, Q'x) # x = (I - Q Q') x
+    axpy!(-1.0, x, work) # work = x-work, we fix it when normalizing
+    rmul!(work, -1.0/norm(work))
+    Q[:,position] .= work
+    mul!(work_depth, Q', x)
+    R[:,position] .= work_depth    
+    #Q,R
+end
+
+function solve_R!(R::Matrix, b::Vector, sol::Vector, realSize::Int64)
+    # Note: R is upper triangular
+    #sol .= 0.0
+    @inbounds sol[realSize] = b[realSize] / R[realSize, realSize]
+    for i in realSize-1:-1:1
+	@inbounds sol[i] = b[i]
+	for j in realSize:-1:(i+1)
+	    @inbounds sol[i] = sol[i] - R[i,j] * sol[j]
+	end
+	@inbounds sol[i] = sol[i] / R[i,i]
+    end
+end
+
+function remove_first_column!(Q::Matrix, R::Matrix)
+    # Shift R
+    for j in 2:size(R,2)
+        @inbounds R[:,j-1] .= R[:,j]
+    end
+    @inbounds R[:,size(R,2)] .= 0.0
+    # Compute rotations and use then
+    for i in 1:(size(R,2)-1) # Last is already null
+        g, r = givens(R, i, i+1, i)
+	lmul!(g, R)
+	rmul!(Q, r')
+    end
+    triu!(R) # triu helps remove some 1e-17 numbers
+end 
 
 @inline converged(it::AARIterable) = it.residual ≤ it.tol
 
@@ -42,7 +86,8 @@ end
 function iterate(it::AARIterable, iteration::Int=start(it))
     # Compute current residual
     ldiv!(it.work, it.Pr, it.u)
-    it.r .= it.b - it.A * it.work
+    mul!(it.work2, it.A, it.work)
+    it.r .= it.b - it.work2
 
     # Check for termination first
     maxit = it.maxiter
@@ -57,35 +102,66 @@ function iterate(it::AARIterable, iteration::Int=start(it))
     ldiv!(it.Pl, it.r) 
 
     # Update F matrix
+    mk = min(iteration, it.depth)
     if iteration > 0
-    #if iteration > 0
-        push!(it.F, it.r - it.r_prev)
-        if size(it.F, 2) > it.depth # Reduce matrix
-            deleteat!(it.F, 1)
-        end
+	it.work .= it.r
+	axpy!(-1.0, it.r_prev, it.work) # work = r - r_prev
+        #push!(it.F, it.r - it.r_prev)
+
+	# Update QR, first remove, then add.
+	#if iteration > it.depth # Reduce matrix
+        #    #deleteat!(it.F, 1)
+	#    remove_first_column!(it.Q, it.R)
+        #end
+	iteration > it.depth && remove_first_column!(it.Q, it.R)
+
+	append_column!(it.Q, it.R, it.work, it.work2, it.work_depth, mk) # Work (arg 3) does not change
+
+	# Note that X updates first, so now we add contributions.
+	# Note also that updating F (here) is done AFTER X, and iterations get shifted.
+	rmul!(it.work, it.beta)
+	idx = ((iteration-1) % it.depth) + 1 # On second iteration (it = 1) we need first element, thus the -1. This gives something in [0,depth-1], so we add 1. 
+	it.FbX[:, idx] .= it.FbX[:, idx] + it.work
+        #println("DEBUG F IDX: $idx")
+
+	# If the matrix has already been filled, then change the starting index
+	if iteration > it.depth
+	    it.first_FX_index += 1
+	    it.first_FX_index = it.first_FX_index % it.depth # Stay in {0,depth-1}
+	end
     end
 
-    @timeit "Update solution" if (iteration+1) % it.p != 0 || iteration == 0
-	print("J ")
-        it.u .= it.u + it.omega * it.r
+    if (iteration+1) % it.p != 0 || iteration == 0
+	print("R ")
+	axpy!(it.omega, it.r, it.u)
     else
 	print("A ")
-	@timeit "F arr" F = reduce(hcat, it.F)
-	#@timeit "X arr" X = reduce(hcat, it.X)
-        @timeit "Weights" weights = F \ it.r # Julia uses QR internally
-	#it.u .= it.u + it.beta * it.r - (X + it.beta * F) * weights
-	it.u .= it.u + it.beta * it.r - it.beta * F * weights
-        mk = size(it.X, 1)
-        @inbounds for i in 1:mk
-            it.u .= it.u - weights[i] * it.X[i]
+	mul!(it.work_depth, it.Q', it.r) 
+	solve_R!(it.R, it.work_depth, it.weights, mk)
+
+	axpy!(it.beta, it.r, it.u)
+        #print("DEBUG WEIGHTS IDX: ")
+        for i in 1:mk
+	    #axpy!(-it.weights[i], it.X[i], it.u)
+	    #axpy!(-it.beta * it.weights[i], it.F[i], it.u)
+	    # First index is started from 0, so we consider shift i to {0,mk-1}, take residue, then add 1 again.
+	    idx = ((it.first_FX_index + i - 1) % it.depth) + 1
+	    #println("DEBUG ERROR FbX ", norm(it.X[i] + it.F[i] - it.FbX[:,idx]))
+	    @inbounds axpy!(-it.weights[i], it.FbX[:, idx], it.u)
         end
     end
 
-    # Update X matrix
-    push!(it.X, it.u - it.u_prev)
-    if size(it.X, 2) > it.depth # Reduce matrix
-        deleteat!(it.X, 1)
-    end
+    # This is X, indexing follows the same previous logic.
+    idx = (iteration % it.depth) + 1
+    it.FbX[:, idx] .= it.u - it.u_prev
+    #println("\nDEBUG X IDX: $idx")
+   
+    #push!(it.X, it.u - it.u_prev)
+    # Update QR, first remove, then add.
+    #if size(it.X, 1) > it.depth # Reduce matrix
+    #    deleteat!(it.X, 1)
+    #end
+
 
     it.r_prev .= it.r
     it.u_prev .= it.u
@@ -93,6 +169,9 @@ function iterate(it::AARIterable, iteration::Int=start(it))
     it.residual = norm(it.r)
 
     # Return the residual at item and iteration number as state
+    #if iteration == 10
+    #     stop("WA")
+    #end
     it.residual, iteration + 1
 end
 
@@ -137,7 +216,19 @@ function aar_iterator!(x, A, b, Pl = Identity(), Pr = Identity();
     r_prev = copy(r)
 
     # Return the iterable
-    AARIterable(A, x, b, Pl, Pr, r, u, similar(x), r_prev, u_prev, [], [], tolerance, residual, one(residual), maxiter, mv_products, depth, p, omega, beta)
+    Q = zeros(size(A,1),depth)
+    R = zeros(depth,depth)
+    work = similar(x)
+    work2 = similar(x)
+    work_depth = zeros(depth)
+    weights = zeros(depth)
+    F = []
+    X = []
+    FbX = zeros(size(A, 1), depth)
+    prev_residual = 1.0
+    first_FX_index = 0 # We start with 0 to be consistent with % operator
+    AARIterable(A, Q, R, x, b, Pl, Pr, r, u, work, work2, work_depth, weights, r_prev, u_prev, FbX, tolerance, residual, prev_residual, maxiter, mv_products, depth, p, omega, beta, first_FX_index)
+
 end
 
 """
