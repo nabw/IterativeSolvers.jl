@@ -39,6 +39,17 @@ end
 @inline done(it::AARNIterable, iteration::Int) = iteration ≥ it.maxiter || converged(it)
 
 
+function appendColumn!(A::Matrix, v::Vector, iteration::Int, depth::Int)
+    if iteration > depth
+        for i in 2:size(A, 2)
+	    A[:,i-1] .= @view A[:,i]
+	end
+	A[:,size(A,2)] .= v
+    else
+	A[:,iteration] .= v
+    end
+end
+
 ###############
 # Ordinary AAR #
 ###############
@@ -47,7 +58,8 @@ function iterate(it::AARNIterable, iteration::Int=start(it))
     # Compute current residual
     ldiv!(it.work, it.Pr, it.u)
     mul!(it.work2, it.A, it.work)
-    it.r .= it.b - it.work2
+    it.r .= it.b 
+    axpy!(-1.0, it.work2, it.r)
 
     # Check for termination first
     maxit = it.maxiter
@@ -66,32 +78,26 @@ function iterate(it::AARNIterable, iteration::Int=start(it))
     if iteration > 0
 	it.work .= it.r
 	axpy!(-1.0, it.r_prev, it.work) # work = r - r_prev
-
-	if iteration > it.depth # Reduce matrix
-	    it.F[:,1:(it.depth-1)] .= it.F[:,2:it.depth]
-	    it.F[:,it.depth] .= it.work
-	else 
-	    it.F[:,iteration] .= it.work
-	end
+	appendColumn!(it.F, it.work, iteration, it.depth)
     end
 
     if (iteration+1) % it.p != 0 || iteration == 0
-	print("R ")
 	axpy!(it.omega, it.r, it.u)
     else
-	print("A ")
-	F = it.F[:, 1:mk]
-	X = it.X[:, 1:mk]
-	weights = (F'F) \ F'it.r
-	it.u .= it.u + it.beta * it.r - (X + it.beta * F) * weights
+	ldiv!(it.weights, svd(it.F), it.r)
+	axpy!(it.beta, it.r, it.u)
+	for i in 1:mk
+	    xx = @view it.X[:,i]
+	    axpy!(-it.weights[i], xx, it.u)
+	    xx = @view it.F[:,i]
+	    axpy!(-it.weights[i], xx, it.u)
+	end
     end
 
-    if iteration >= it.depth
-        it.X[:,1:(it.depth-1)] .= it.X[:,2:it.depth]
-        it.X[:,it.depth] .= it.u - it.u_prev
-    else 
-        it.X[:,iteration+1] .= it.u - it.u_prev
-    end
+    it.work .= it.u
+    axpy!(-1.0, it.u_prev, it.work)
+    itp1 = iteration + 1
+    appendColumn!(it.X, it.work, itp1, it.depth)
 
 
     it.r_prev .= it.r
@@ -136,7 +142,7 @@ function aarn_iterator!(x, A, b, Pl = Identity(), Pr = Identity();
     u .= x
     copyto!(r, b)
 
-    mul!(c, A, x)
+    #mul!(c, A, x)
     mv_products=1
     residual = norm(r)
     tolerance = max(reltol * residual, abstol)
@@ -248,3 +254,4 @@ function aar_naive!(x, A, b;
 
     log ? (iterable.x, history) : iterable.x
 end
+
