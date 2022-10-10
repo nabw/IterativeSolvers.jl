@@ -32,19 +32,16 @@ mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     p::Int
     omega::Real
     beta::Real
-    first_FX_index::Int
 end
 
 
 function appendColumnToMatrix!(A::Matrix, v::Vector, iteration::Int, depth::Int)
     if iteration > depth
         for i in 2:size(A, 2)
-	    A[:,i-1] .= view(A,:,i)
+	    copy!(view(A,:,i-1), view(A,:,i))
 	end
-	#A[:,size(A,2)] .= v
 	copy!(view(A,:,size(A,2)), v)
     else
-	#A[:,iteration] .= v
 	copy!(view(A,:,iteration), v)
     end
 end
@@ -70,7 +67,6 @@ function computeProjection!(work::Vector, work2::Vector, work_depth::Vector, wor
         computeProjectionStep!(work2, work_depth2, work, Q) # work is previous solution, we project that one into work2
         axpy!(1.0, work_depth2, work_depth) # We add increment of projection
         norm_current = norm(work2)
-        #work .= work2
 	copy!(work, work2)
     end
     normalize!(work)
@@ -81,9 +77,7 @@ end
 function append_column!(Q::Matrix, R::Matrix, x::Vector, work::Vector, work2::Vector, work_depth::Vector, work_depth2::Vector, position::Int)
     rho = computeProjection!(work, work2, work_depth, work_depth2, x, Q)    
     
-    #Q[:,position] .= work
     copy!(view(Q,:,position), work)
-    #R[:,position] .= work_depth    
     copy!(view(R,:,position), work_depth)
     R[position, position] = rho
 end
@@ -103,7 +97,6 @@ end
 function remove_first_column!(Q::Matrix, R::Matrix)
     # Shift R
     for j in 2:size(R,2)
-        #R[:,j-1] .= view(R,:,j)
 	copy!(view(R,:,j-1), view(R,:,j))
     end
     R[:,size(R,2)] .= 0.0
@@ -131,7 +124,6 @@ function iterate(it::AARIterable, iteration::Int=start(it))
     # Compute current residual
     ldiv!(it.work, it.Pr, it.u)
     mul!(it.work2, it.A, it.work)
-    #it.r .= it.b
     copy!(it.r, it.b)
     axpy!(-1.0, it.work2, it.r)
 
@@ -158,11 +150,6 @@ function iterate(it::AARIterable, iteration::Int=start(it))
 	axpy!(-1.0, it.r_prev, it.dr) # work = r - r_prev
 	append_column!(it.Q, it.R, it.dr, it.work, it.work2, it.work_depth, it.work_depth2, mk) # Work (arg 3) does not change
 
-#	# If the matrix has already been filled, then change the starting index
-#	if iteration > it.depth
-#	    it.first_FX_index += 1
-#	    it.first_FX_index = it.first_FX_index % it.depth # Stay in {0,depth-1}
-#	end
     end
 
     if (iteration+1) % it.p != 0 || iteration == 0
@@ -191,8 +178,10 @@ function iterate(it::AARIterable, iteration::Int=start(it))
     appendColumnToMatrix!(it.X, it.work, itp1, it.depth)
     #it.X[:, idx] .= it.work
 
-    it.r_prev .= it.r
-    it.u_prev .= it.u
+    #it.r_prev .= it.r
+    copy!(it.r_prev, it.r)
+    #it.u_prev .= it.u
+    copy!(it.u_prev, it.u)
     it.prev_residual = it.residual
     it.residual = norm(it.r)
 
@@ -234,7 +223,7 @@ function aar_iterator!(x, A, b, Pl = Identity(), Pr = Identity();
     u .= x
     copyto!(r, b)
 
-    mul!(c, A, x)
+    #mul!(c, A, x)
     mv_products=1
     residual = norm(r)
     tolerance = max(reltol * residual, abstol)
@@ -247,13 +236,12 @@ function aar_iterator!(x, A, b, Pl = Identity(), Pr = Identity();
     work = similar(x)
     work2 = similar(x)
     work_depth = zeros(depth)
-    work_depth2 = zeros(depth)
-    weights = zeros(depth)
-    X = zeros(size(A, 1), depth)
+    work_depth2 = similar(work_depth)
+    weights = similar(work_depth)
+    X = similar(Q)
     prev_residual = 1.0
-    first_FX_index = 0 # We start with 0 to be consistent with % operator
 
-    AARIterable(A, Q, R, x, b, Pl, Pr, r, dr, u, work, work2, work_depth, work_depth2, weights, r_prev, u_prev, X, tolerance, residual, prev_residual, maxiter, mv_products, depth, p, omega, beta, first_FX_index)
+    AARIterable(A, Q, R, x, b, Pl, Pr, r, dr, u, work, work2, work_depth, work_depth2, weights, r_prev, u_prev, X, tolerance, residual, prev_residual, maxiter, mv_products, depth, p, omega, beta)
 
 end
 
@@ -341,7 +329,7 @@ function aar!(x, A, b;
 
     # Add final correction for right preconditioning
     ldiv!(Pr, iterable.u)
-    x .= iterable.u
+    copy!(x, iterable.u)
 
     verbose && println()
     log && setconv(history, converged(iterable))
