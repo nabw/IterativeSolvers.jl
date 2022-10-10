@@ -22,7 +22,7 @@ mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     weights::vecT
     r_prev::vecT
     u_prev::solT
-    FbX::Matrix # Dense matrix containing X + beta F
+    X::Matrix # Dense matrix containing X + beta F
     tol::numT
     residual::numT
     prev_residual::numT
@@ -34,6 +34,22 @@ mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     beta::Real
     first_FX_index::Int
 end
+
+
+function appendColumnToMatrix!(A::Matrix, v::Vector, iteration::Int, depth::Int)
+    if iteration > depth
+        for i in 2:size(A, 2)
+	    A[:,i-1] .= view(A,:,i)
+	end
+	#A[:,size(A,2)] .= v
+	copy!(view(A,:,size(A,2)), v)
+    else
+	#A[:,iteration] .= v
+	copy!(view(A,:,iteration), v)
+    end
+end
+
+
 
 # work=(I - Q Q')x, work_depth=Q'x
 function computeProjectionStep!(work::Vector, work_depth::Vector, x::Vector, Q::Matrix)
@@ -49,13 +65,13 @@ function computeProjection!(work::Vector, work2::Vector, work_depth::Vector, wor
     norm_prev = norm(x)
     computeProjectionStep!(work, work_depth, x, Q) 
     norm_current = norm(work)
-    while norm_current < 0.9 * norm_prev
-        println("DEBUG REORTHO! ")
+    while norm_current < 0.7 * norm_prev
         norm_prev = norm(work)
         computeProjectionStep!(work2, work_depth2, work, Q) # work is previous solution, we project that one into work2
         axpy!(1.0, work_depth2, work_depth) # We add increment of projection
         norm_current = norm(work2)
-        work .= work2
+        #work .= work2
+	copy!(work, work2)
     end
     normalize!(work)
     norm_current
@@ -65,29 +81,32 @@ end
 function append_column!(Q::Matrix, R::Matrix, x::Vector, work::Vector, work2::Vector, work_depth::Vector, work_depth2::Vector, position::Int)
     rho = computeProjection!(work, work2, work_depth, work_depth2, x, Q)    
     
-    @inbounds Q[:,position] .= work
-    @inbounds R[:,position] .= work_depth    
-    @inbounds R[position, position] = rho
+    #Q[:,position] .= work
+    copy!(view(Q,:,position), work)
+    #R[:,position] .= work_depth    
+    copy!(view(R,:,position), work_depth)
+    R[position, position] = rho
 end
 
 function solve_R!(R::Matrix, b::Vector, sol::Vector, realSize::Int64)
     # Note: R is upper triangular
-    @inbounds sol[realSize] = b[realSize] / R[realSize, realSize]
+    sol[realSize] = b[realSize] / R[realSize, realSize]
     for i in realSize-1:-1:1
-	@inbounds sol[i] = b[i]
+	sol[i] = b[i]
 	for j in realSize:-1:(i+1)
-	    @inbounds sol[i] = sol[i] - R[i,j] * sol[j]
+	    sol[i] = sol[i] - R[i,j] * sol[j]
 	end
-	@inbounds sol[i] = sol[i] / R[i,i]
+	sol[i] = sol[i] / R[i,i]
     end
 end
 
 function remove_first_column!(Q::Matrix, R::Matrix)
     # Shift R
     for j in 2:size(R,2)
-        @inbounds R[:,j-1] .= R[:,j]
+        #R[:,j-1] .= view(R,:,j)
+	copy!(view(R,:,j-1), view(R,:,j))
     end
-    @inbounds R[:,size(R,2)] .= 0.0
+    R[:,size(R,2)] .= 0.0
     # Compute rotations and use then
     for i in 1:(size(R,2)-1) # Last is already null
         g, r = givens(R, i, i+1, i)
@@ -112,7 +131,9 @@ function iterate(it::AARIterable, iteration::Int=start(it))
     # Compute current residual
     ldiv!(it.work, it.Pr, it.u)
     mul!(it.work2, it.A, it.work)
-    it.r .= it.b - it.work2
+    #it.r .= it.b
+    copy!(it.r, it.b)
+    axpy!(-1.0, it.work2, it.r)
 
     # Check for termination first
     maxit = it.maxiter
@@ -131,21 +152,17 @@ function iterate(it::AARIterable, iteration::Int=start(it))
     if iteration > 0
 	iteration > it.depth && remove_first_column!(it.Q, it.R)
 
+	# Add r - r_prev to QR
+	#it.dr .= it.r
+	copy!(it.dr, it.r)
+	axpy!(-1.0, it.r_prev, it.dr) # work = r - r_prev
 	append_column!(it.Q, it.R, it.dr, it.work, it.work2, it.work_depth, it.work_depth2, mk) # Work (arg 3) does not change
 
-	# Note that X updates first, so now we add contributions.
-	# Note also that updating F (here) is done AFTER X, and iterations get shifted.
-	it.dr .= it.r
-	axpy!(-1.0, it.r_prev, it.dr) # work = r - r_prev
-	rmul!(it.dr, it.beta)
-	idx = ((iteration-1) % it.depth) + 1 # On second iteration (it = 1) we need first element, thus the -1. This gives something in [0,depth-1], so we add 1. 
-	it.FbX[:, idx] .= it.FbX[:, idx] + it.dr  # X + beta F
-
-	# If the matrix has already been filled, then change the starting index
-	if iteration > it.depth
-	    it.first_FX_index += 1
-	    it.first_FX_index = it.first_FX_index % it.depth # Stay in {0,depth-1}
-	end
+#	# If the matrix has already been filled, then change the starting index
+#	if iteration > it.depth
+#	    it.first_FX_index += 1
+#	    it.first_FX_index = it.first_FX_index % it.depth # Stay in {0,depth-1}
+#	end
     end
 
     if (iteration+1) % it.p != 0 || iteration == 0
@@ -156,20 +173,23 @@ function iterate(it::AARIterable, iteration::Int=start(it))
 	mul!(it.work_depth, it.Q', it.r) 
 	solve_R!(it.R, it.work_depth, it.weights, mk)
 
+	mul!(it.work, it.X, it.weights)
        
-        it.work .= 0.0 # Accumulate (X + beta F) * weights
-        for i in 1:mk
-	    # First index is started from 0, so we consider shift i to {0,mk-1}, take residue, then add 1 again.
-	    idx = ((it.first_FX_index + i - 1) % it.depth) + 1
-	    @inbounds axpy!(it.weights[i], it.FbX[:, idx], it.work)
-        end
-	axpy!(-1.0, it.work, it.u)
+	axpy!(-1.0, it.work, it.u) # u = u - X * weights
+	mul!(it.work, it.A, it.u)
+	axpby!(1.0, it.b, -1.0, it.work) # work = residual of accelerated u
+	axpy!(it.beta, it.work, it.u)
 	axpy!(it.beta, it.r, it.u)
     end
 
     # This is X, indexing follows the same previous logic.
     idx = (iteration % it.depth) + 1
-    it.FbX[:, idx] .= it.u - it.u_prev
+    #it.work .= it.u
+    copy!(it.work, it.u)
+    axpy!(-1.0, it.u_prev, it.work)
+    itp1 = iteration + 1
+    appendColumnToMatrix!(it.X, it.work, itp1, it.depth)
+    #it.X[:, idx] .= it.work
 
     it.r_prev .= it.r
     it.u_prev .= it.u
@@ -229,11 +249,11 @@ function aar_iterator!(x, A, b, Pl = Identity(), Pr = Identity();
     work_depth = zeros(depth)
     work_depth2 = zeros(depth)
     weights = zeros(depth)
-    FbX = zeros(size(A, 1), depth)
+    X = zeros(size(A, 1), depth)
     prev_residual = 1.0
     first_FX_index = 0 # We start with 0 to be consistent with % operator
 
-    AARIterable(A, Q, R, x, b, Pl, Pr, r, dr, u, work, work2, work_depth, work_depth2, weights, r_prev, u_prev, FbX, tolerance, residual, prev_residual, maxiter, mv_products, depth, p, omega, beta, first_FX_index)
+    AARIterable(A, Q, R, x, b, Pl, Pr, r, dr, u, work, work2, work_depth, work_depth2, weights, r_prev, u_prev, X, tolerance, residual, prev_residual, maxiter, mv_products, depth, p, omega, beta, first_FX_index)
 
 end
 
