@@ -66,10 +66,8 @@ function iterate(it::AARNIterable, iteration::Int=start(it))
     if iteration > 0
 	it.work .= it.r
 	axpy!(-1.0, it.r_prev, it.work) # work = r - r_prev
-        #push!(it.F, it.r - it.r_prev)
 
 	if iteration > it.depth # Reduce matrix
-            #deleteat!(it.F, 1)
 	    it.F[:,1:(it.depth-1)] .= it.F[:,2:it.depth]
 	    it.F[:,it.depth] .= it.work
 	else 
@@ -88,11 +86,6 @@ function iterate(it::AARNIterable, iteration::Int=start(it))
 	it.u .= it.u + it.beta * it.r - (X + it.beta * F) * weights
     end
 
-    #push!(it.X, it.u - it.u_prev)
-    # Update QR, first remove, then add.
-    #if size(it.X, 1) > it.depth # Reduce matrix
-    #    deleteat!(it.X, 1)
-    #end
     if iteration >= it.depth
         it.X[:,1:(it.depth-1)] .= it.X[:,2:it.depth]
         it.X[:,it.depth] .= it.u - it.u_prev
