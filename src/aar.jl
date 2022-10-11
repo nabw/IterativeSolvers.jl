@@ -1,8 +1,8 @@
 import Base: iterate
 using Printf
 using LinearAlgebra:norm
-#using TimerOutputs
-export aar, aar!, AARIterable, aar_iterator!, AARStateVariables
+using TimerOutputs
+export aar, aar!, AARIterable, aar_iterator!
 
 mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     A::matT
@@ -14,15 +14,14 @@ mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     Pr::precrT
     r::vecT
     dr::vecT
-    u::vecT
     work::vecT
     work2::vecT
     work_depth::vecT
     work_depth2::vecT
     weights::vecT
     r_prev::vecT
-    u_prev::solT
-    X::Matrix # Dense matrix containing X + beta F
+    x_prev::solT
+    X::Matrix 
     tol::numT
     residual::numT
     prev_residual::numT
@@ -62,12 +61,12 @@ function computeProjection!(work::Vector, work2::Vector, work_depth::Vector, wor
     norm_prev = norm(x)
     computeProjectionStep!(work, work_depth, x, Q) 
     norm_current = norm(work)
-    while norm_current < 0.7 * norm_prev
+    while norm_current < 1/sqrt(2) * norm_prev # value 1/sqrt(2) from reference work
         norm_prev = norm(work)
         computeProjectionStep!(work2, work_depth2, work, Q) # work is previous solution, we project that one into work2
         axpy!(1.0, work_depth2, work_depth) # We add increment of projection
         norm_current = norm(work2)
-	copy!(work, work2)
+        copy!(work, work2)
     end
     normalize!(work)
     norm_current
@@ -79,34 +78,35 @@ function append_column!(Q::Matrix, R::Matrix, x::Vector, work::Vector, work2::Ve
     
     copy!(view(Q,:,position), work)
     copy!(view(R,:,position), work_depth)
-    R[position, position] = rho
+    @inbounds R[position, position] = rho
 end
 
 function solve_R!(R::Matrix, b::Vector, sol::Vector, realSize::Int64)
     # Note: R is upper triangular
-    sol[realSize] = b[realSize] / R[realSize, realSize]
+    @inbounds sol[realSize] = b[realSize] / R[realSize, realSize]
     for i in realSize-1:-1:1
-	sol[i] = b[i]
+	@inbounds sol[i] = b[i]
 	for j in realSize:-1:(i+1)
-	    sol[i] = sol[i] - R[i,j] * sol[j]
+	    @inbounds sol[i] = sol[i] - R[i,j] * sol[j]
 	end
-	sol[i] = sol[i] / R[i,i]
+	@inbounds sol[i] = sol[i] / R[i,i]
     end
 end
 
 function remove_first_column!(Q::Matrix, R::Matrix)
     # Shift R
-    for j in 2:size(R,2)
+    for j in 2:size(R, 2)
 	copy!(view(R,:,j-1), view(R,:,j))
     end
-    R[:,size(R,2)] .= 0.0
+    @inbounds R[:,size(R,2)] .= 0.0
     # Compute rotations and use then
-    for i in 1:(size(R,2)-1) # Last is already null
+    for i in 1:(size(R, 2) - 1) # Last is already null
         g, r = givens(R, i, i+1, i)
 	lmul!(g, R)
-	rmul!(Q, r')
+	rmul!(Q, g')
     end
     triu!(R) # triu helps remove some 1e-17 numbers
+    @inbounds Q[:,size(Q, 2)] .= 0.0 # Last column disappears
 end 
 
 @inline converged(it::AARIterable) = it.residual ≤ it.tol
@@ -115,6 +115,22 @@ end
 
 @inline done(it::AARIterable, iteration::Int) = iteration ≥ it.maxiter || converged(it)
 
+# Apply matrix A to x. AARIt is used to obtain A, Pr. 
+function applyA!(it::AARIterable, x::vecT, work::vecT, result::vecT) where vecT
+    ldiv!(work, it.Pr, x)
+    mul!(result, it.A, work)
+end
+
+# Compute residual b - Ax and return unpreconditioned norm. AARIt is used to obtain A, Pr and b. 
+function computeResidual!(it::AARIterable, x::vecT, result::vecT, work::vecT, work2::vecT) where vecT
+    applyA!(it, x, work, work2) # Result in work2
+    copy!(result, it.b)
+    axpy!(-1.0, work2, result) # result = b - Ax
+    res_norm = norm(result) 
+    ldiv!(it.Pl, result) # result = Pl(b-Ax)
+    res_norm
+end
+
 
 ###############
 # Ordinary AAR #
@@ -122,112 +138,67 @@ end
 
 function iterate(it::AARIterable, iteration::Int=start(it))
     # Compute current residual
-    ldiv!(it.work, it.Pr, it.u)
-    mul!(it.work2, it.A, it.work)
-    copy!(it.r, it.b)
-    axpy!(-1.0, it.work2, it.r)
+    it.residual = computeResidual!(it, it.x, it.r, it.work, it.work2)
 
     # Check for termination first
-    maxit = it.maxiter
-    res = it.residual
-    tole = it.tol
     if done(it, iteration)
         return nothing
     end
 
-    # Note: Using preconditioned residuals for mixing, 
-    # but original one for computing errors
-    ldiv!(it.Pl, it.r) 
-
-    # Update F matrix
+    # Update QR factorization
     mk = min(iteration, it.depth)
     if iteration > 0
 	iteration > it.depth && remove_first_column!(it.Q, it.R)
 
 	# Add r - r_prev to QR
-	#it.dr .= it.r
 	copy!(it.dr, it.r)
 	axpy!(-1.0, it.r_prev, it.dr) # work = r - r_prev
 	append_column!(it.Q, it.R, it.dr, it.work, it.work2, it.work_depth, it.work_depth2, mk) # Work (arg 3) does not change
-
     end
+    copy!(it.r_prev, it.r) # We copy right away as it.r is modified in acceleration.
 
     if (iteration+1) % it.p != 0 || iteration == 0
-	print("R ")
-	axpy!(it.omega, it.r, it.u)
+        # Richardson step
+	axpy!(it.omega, it.r, it.x)
     else
-	print("A ")
+        # Anderson step
 	mul!(it.work_depth, it.Q', it.r) 
 	solve_R!(it.R, it.work_depth, it.weights, mk)
 
 	mul!(it.work, it.X, it.weights)
        
-	axpy!(-1.0, it.work, it.u) # u = u - X * weights
-	mul!(it.work, it.A, it.u)
-	axpby!(1.0, it.b, -1.0, it.work) # work = residual of accelerated u
-	axpy!(it.beta, it.work, it.u)
-	axpy!(it.beta, it.r, it.u)
+	axpy!(-1.0, it.work, it.x) # x = x - X * weights
+        computeResidual!(it, it.x, it.r, it.work, it.work2) # NOTE: it.r is changed here
+	axpy!(it.beta, it.r, it.x) # Add accelerated residual
     end
 
     # This is X, indexing follows the same previous logic.
     idx = (iteration % it.depth) + 1
-    #it.work .= it.u
-    copy!(it.work, it.u)
-    axpy!(-1.0, it.u_prev, it.work)
+    copy!(it.work, it.x)
+    axpy!(-1.0, it.x_prev, it.work)
     itp1 = iteration + 1
     appendColumnToMatrix!(it.X, it.work, itp1, it.depth)
-    #it.X[:, idx] .= it.work
 
-    #it.r_prev .= it.r
-    copy!(it.r_prev, it.r)
-    #it.u_prev .= it.u
-    copy!(it.u_prev, it.u)
+    copy!(it.x_prev, it.x)
     it.prev_residual = it.residual
-    it.residual = norm(it.r)
 
     # Return the residual at item and iteration number as state
     it.residual, iteration + 1
 end
 
-#####################
-# Preconditioned AAR #
-#####################
-
 # Utility functions
-
-"""
-Intermediate AAR state variables to be used inside aar and aar!. `u`, `r` and `c` should be of the same type as the solution of `aar` or `aar!`.
-```
-struct AARStateVariables{T,Tx<:AbstractArray{T}}
-    u::Tx
-    r::Tx
-    c::Tx
-end
-```
-"""
-struct AARStateVariables{T,Tx<:AbstractArray{T}}
-    u::Tx
-    r::Tx
-    c::Tx
-end
 
 function aar_iterator!(x, A, b, Pl = Identity(), Pr = Identity();
                       abstol::Real = zero(real(eltype(b))),
                       reltol::Real = sqrt(eps(real(eltype(b)))),
-                      maxiter::Int = size(A, 2),
-                      statevars::AARStateVariables = AARStateVariables(zero(x), similar(x), similar(x)), depth::Int=1, p::Int=1, omega::Real=1.0, beta::Real=1.0)
-    u = statevars.u
-    r = statevars.r
+                      maxiter::Int = size(A, 2), depth::Int=1, p::Int=1, omega::Real=1.0, beta::Real=1.0)
+    r = copy(b)
     dr = copy(r)
-    c = statevars.c
-    u .= x
-    copyto!(r, b)
 
-    #mul!(c, A, x)
-    mv_products=1
+    mv_products=0
     residual = norm(r)
     tolerance = max(reltol * residual, abstol)
-    u_prev = copy(u)
+    x_prev = copy(x)
     r_prev = copy(r)
 
     # Return the iterable
@@ -237,11 +208,11 @@ function aar_iterator!(x, A, b, Pl = Identity(), Pr = Identity();
     work2 = similar(x)
     work_depth = zeros(depth)
     work_depth2 = similar(work_depth)
-    weights = similar(work_depth)
-    X = similar(Q)
+    weights = zeros(size(work_depth))
+    X = zeros(size(Q))
     prev_residual = 1.0
 
-    AARIterable(A, Q, R, x, b, Pl, Pr, r, dr, u, work, work2, work_depth, work_depth2, weights, r_prev, u_prev, X, tolerance, residual, prev_residual, maxiter, mv_products, depth, p, omega, beta)
+    AARIterable(A, Q, R, x, b, Pl, Pr, r, dr, work, work2, work_depth, work_depth2, weights, r_prev, x_prev, X, tolerance, residual, prev_residual, maxiter, mv_products, depth, p, omega, beta)
 
 end
 
@@ -263,7 +234,6 @@ aar(A, b; kwargs...) = aar!(zerox(A, b), A, b; kwargs...)
 
 ## Keywords
 
-- `statevars::AARStateVariables`: Has 3 arrays similar to `x` to hold intermediate results;
 - `Pl = Identity()`: left preconditioner of the method. Should be symmetric,
   positive-definite like `A`;
 - `abstol::Real = zero(real(eltype(b)))`,
@@ -299,7 +269,6 @@ function aar!(x, A, b;
              reltol::Real = sqrt(eps(real(eltype(b)))),
              maxiter::Int = size(A, 2),
              log::Bool = false,
-             statevars::AARStateVariables = AARStateVariables(zero(x), similar(x), similar(x)),
              verbose::Bool = false,
              Pl = Identity(),
              Pr = Identity(),
@@ -315,7 +284,7 @@ function aar!(x, A, b;
 
     # Actually perform AAR
     iterable = aar_iterator!(x, A, b, Pl, Pr; abstol = abstol, reltol = reltol, maxiter = maxiter,
-                            statevars = statevars, depth = depth, p = p, omega = omega, beta = beta, kwargs...)
+                            depth = depth, p = p, omega = omega, beta = beta, kwargs...)
     if log
         history.mvps = iterable.mv_products
     end
@@ -328,8 +297,8 @@ function aar!(x, A, b;
     end
 
     # Add final correction for right preconditioning
-    ldiv!(Pr, iterable.u)
-    copy!(x, iterable.u)
+    ldiv!(Pr, iterable.x)
+    copy!(x, iterable.x)
 
     verbose && println()
     log && setconv(history, converged(iterable))
