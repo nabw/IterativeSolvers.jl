@@ -1,8 +1,8 @@
-import Base: iterate
+import Base: terate
 using Printf
 using LinearAlgebra:norm
 #using TimerOutputs
-export aar, aar!, AARIterable, aar_iterator!
+export aar, aar!, AARIterable, aar_terator!
 
 mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     A::matT
@@ -25,7 +25,7 @@ mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     tol::numT
     residual::numT
     prev_residual::numT
-    maxiter::Int
+    maiter::Int
     mv_products::Int
     depth::Int
     p::Int
@@ -153,7 +153,7 @@ function iterate(it::AARIterable, iteration::Int=start(it))
 	# Add r - r_prev to QR
 	copy!(it.dr, it.r)
 	axpy!(-1.0, it.r_prev, it.dr) # work = r - r_prev
-        axpy!(it.beta, it.dr, view(it.X,:,mk)) # Set X <- X + beta F
+        axpy!(it.beta, it.dr, view(it.XF,:,mk)) # Set X <- X + beta F
 	append_column!(it.Q, it.R, it.dr, it.work, it.work2, it.work_depth, it.work_depth2, mk) # Work (arg 3) does not change
     end
 
@@ -167,7 +167,7 @@ function iterate(it::AARIterable, iteration::Int=start(it))
 
         # Now we do x <- x + beta * r - (X + beta F) weights
 	axpy!(it.beta, it.r, it.x) 
-	mul!(it.work, it.X, it.weights)
+	mul!(it.work, it.XF, it.weights)
 	axpy!(-1.0, it.work, it.x) 
     end
 
@@ -175,7 +175,7 @@ function iterate(it::AARIterable, iteration::Int=start(it))
     idx = (iteration % it.depth) + 1
     copy!(it.work, it.x)
     axpy!(-1.0, it.x_prev, it.work)
-    appendColumnToMatrix!(it.X, it.work, iteration+1, it.depth)
+    appendColumnToMatrix!(it.XF, it.work, iteration+1, it.depth)
 
     copy!(it.x_prev, it.x)
     copy!(it.r_prev, it.r) 
