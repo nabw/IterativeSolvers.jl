@@ -74,9 +74,8 @@ function computeProjection!(work::Vector, work2::Vector, work_depth::Vector, wor
 end
 
 # Note: x does not change
-function append_column!(Q::Matrix, R::Matrix, x::Vector, work::Vector, work2::Vector, work_depth::Vector, work_depth2::Vector, position::Int)
-    rho = computeProjection!(work, work2, work_depth, work_depth2, x, Q, it.reorthogonalization_factor)    
-    
+function append_column!(Q::Matrix, R::Matrix, x::Vector, work::Vector, work2::Vector, work_depth::Vector, work_depth2::Vector, position::Int, reorthogonalization_factor)
+    rho = computeProjection!(work, work2, work_depth, work_depth2, x, Q, reorthogonalization_factor)    
     copy!(view(Q,:,position), work)
     copy!(view(R,:,position), work_depth)
     @inbounds R[position, position] = rho
@@ -155,7 +154,7 @@ function iterate(it::AARIterable, iteration::Int=start(it))
 	copy!(it.dr, it.r)
 	axpy!(-1.0, it.r_prev, it.dr) # work = r - r_prev
         axpy!(it.beta, it.dr, view(it.XF,:,mk)) # Set X <- X + beta F
-	append_column!(it.Q, it.R, it.dr, it.work, it.work2, it.work_depth, it.work_depth2, mk) # Work (arg 3) does not change
+	append_column!(it.Q, it.R, it.dr, it.work, it.work2, it.work_depth, it.work_depth2, mk, it.reorthogonalization_factor) # Work (arg 3) does not change
     end
 
     if (iteration+1) % it.p != 0 || iteration == 0
