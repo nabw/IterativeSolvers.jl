@@ -1,7 +1,7 @@
 import Base: iterate
 using Printf
 using LinearAlgebra:norm
-using TimerOutputs
+#using TimerOutputs
 export aar, aar!, AARIterable, aar_iterator!
 
 mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
@@ -21,7 +21,7 @@ mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     weights::vecT
     r_prev::vecT
     x_prev::solT
-    X::Matrix 
+    XF::Matrix 
     tol::numT
     residual::numT
     prev_residual::numT
@@ -153,9 +153,9 @@ function iterate(it::AARIterable, iteration::Int=start(it))
 	# Add r - r_prev to QR
 	copy!(it.dr, it.r)
 	axpy!(-1.0, it.r_prev, it.dr) # work = r - r_prev
+        axpy!(it.beta, it.dr, view(it.X,:,mk)) # Set X <- X + beta F
 	append_column!(it.Q, it.R, it.dr, it.work, it.work2, it.work_depth, it.work_depth2, mk) # Work (arg 3) does not change
     end
-    copy!(it.r_prev, it.r) # We copy right away as it.r is modified in acceleration.
 
     if (iteration+1) % it.p != 0 || iteration == 0
         # Richardson step
@@ -165,21 +165,20 @@ function iterate(it::AARIterable, iteration::Int=start(it))
 	mul!(it.work_depth, it.Q', it.r) 
 	solve_R!(it.R, it.work_depth, it.weights, mk)
 
+        # Now we do x <- x + beta * r - (X + beta F) weights
+	axpy!(it.beta, it.r, it.x) 
 	mul!(it.work, it.X, it.weights)
-       
-	axpy!(-1.0, it.work, it.x) # x = x - X * weights
-        computeResidual!(it, it.x, it.r, it.work, it.work2) # NOTE: it.r is changed here
-	axpy!(it.beta, it.r, it.x) # Add accelerated residual
+	axpy!(-1.0, it.work, it.x) 
     end
 
     # This is X, indexing follows the same previous logic.
     idx = (iteration % it.depth) + 1
     copy!(it.work, it.x)
     axpy!(-1.0, it.x_prev, it.work)
-    itp1 = iteration + 1
-    appendColumnToMatrix!(it.X, it.work, itp1, it.depth)
+    appendColumnToMatrix!(it.X, it.work, iteration+1, it.depth)
 
     copy!(it.x_prev, it.x)
+    copy!(it.r_prev, it.r) 
     it.prev_residual = it.residual
 
     # Return the residual at item and iteration number as state
@@ -209,10 +208,10 @@ function aar_iterator!(x, A, b, Pl = Identity(), Pr = Identity();
     work_depth = zeros(depth)
     work_depth2 = similar(work_depth)
     weights = zeros(size(work_depth))
-    X = zeros(size(Q))
+    XF = zeros(size(Q))
     prev_residual = 1.0
 
-    AARIterable(A, Q, R, x, b, Pl, Pr, r, dr, work, work2, work_depth, work_depth2, weights, r_prev, x_prev, X, tolerance, residual, prev_residual, maxiter, mv_products, depth, p, omega, beta)
+    AARIterable(A, Q, R, x, b, Pl, Pr, r, dr, work, work2, work_depth, work_depth2, weights, r_prev, x_prev, XF, tolerance, residual, prev_residual, maxiter, mv_products, depth, p, omega, beta)
 
 end
 
@@ -272,14 +271,15 @@ function aar!(x, A, b;
              verbose::Bool = false,
              Pl = Identity(),
              Pr = Identity(),
-	     depth::Int = 5,
-	     p::Int = 1,
+	     depth::Int = 10,
+	     p::Int = 5,
 	     omega::Real = 1.0,
 	     beta::Real = 1.0,
              kwargs...)
     history = ConvergenceHistory(partial = !log)
     history[:abstol] = abstol
     history[:reltol] = reltol
+    verbose && @printf("=== aar ===\n%4s\t%4s\t%7s\n","rest","iter","resnorm")
     log && reserve!(history, :resnorm, maxiter + 1)
 
     # Actually perform AAR
