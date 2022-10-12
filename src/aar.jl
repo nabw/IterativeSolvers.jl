@@ -25,7 +25,7 @@ mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     tol::numT
     residual::numT
     prev_residual::numT
-    maiter::Int
+    maxiter::Int
     mv_products::Int
     depth::Int
     p::Int
