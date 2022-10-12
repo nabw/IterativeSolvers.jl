@@ -31,6 +31,7 @@ mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     p::Int
     omega::Real
     beta::Real
+    reorthogonalization_factor::Real
 end
 
 
@@ -57,11 +58,11 @@ end
 
 # projection is stored in work, new column of R is stored in work_depth
 # See Daniel, Gragg, Kaufman, Stewart. Mathematics of Computation (1976).
-function computeProjection!(work::Vector, work2::Vector, work_depth::Vector, work_depth2::Vector, x::Vector, Q::Matrix)
+function computeProjection!(work::Vector, work2::Vector, work_depth::Vector, work_depth2::Vector, x::Vector, Q::Matrix, reorthogonalization_factor::Real)
     norm_prev = norm(x)
     computeProjectionStep!(work, work_depth, x, Q) 
     norm_current = norm(work)
-    while norm_current < 1/sqrt(2) * norm_prev # value 1/sqrt(2) from reference work
+    while norm_current < reorthogonalization_factor * norm_prev 
         norm_prev = norm(work)
         computeProjectionStep!(work2, work_depth2, work, Q) # work is previous solution, we project that one into work2
         axpy!(1.0, work_depth2, work_depth) # We add increment of projection
@@ -190,7 +191,12 @@ end
 function aar_iterator!(x, A, b, Pl = Identity(), Pr = Identity();
                       abstol::Real = zero(real(eltype(b))),
                       reltol::Real = sqrt(eps(real(eltype(b)))),
-                      maxiter::Int = size(A, 2), depth::Int=1, p::Int=1, omega::Real=1.0, beta::Real=1.0)
+                      maxiter::Int = size(A, 2), 
+                      depth::Int=1,  
+                      p::Int=1,  
+                      omega::Real=1.0, 
+                      beta::Real=1.0,
+                      reorthogonalization_factor::0.0)
     r = copy(b)
     dr = copy(r)
 
@@ -211,7 +217,7 @@ function aar_iterator!(x, A, b, Pl = Identity(), Pr = Identity();
     XF = zeros(size(Q))
     prev_residual = 1.0
 
-    AARIterable(A, Q, R, x, b, Pl, Pr, r, dr, work, work2, work_depth, work_depth2, weights, r_prev, x_prev, XF, tolerance, residual, prev_residual, maxiter, mv_products, depth, p, omega, beta)
+    AARIterable(A, Q, R, x, b, Pl, Pr, r, dr, work, work2, work_depth, work_depth2, weights, r_prev, x_prev, XF, tolerance, residual, prev_residual, maxiter, mv_products, depth, p, omega, beta, reorthogonalization_factor)
 
 end
 
