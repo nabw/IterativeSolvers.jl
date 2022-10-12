@@ -196,7 +196,7 @@ function aar_iterator!(x, A, b, Pl = Identity(), Pr = Identity();
                       p::Int=1,  
                       omega::Real=1.0, 
                       beta::Real=1.0,
-                      reorthogonalization_factor::0.0)
+                      reorthogonalization_factor::Real=0.0)
     r = copy(b)
     dr = copy(r)
 
