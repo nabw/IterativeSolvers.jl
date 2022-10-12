@@ -75,7 +75,7 @@ end
 
 # Note: x does not change
 function append_column!(Q::Matrix, R::Matrix, x::Vector, work::Vector, work2::Vector, work_depth::Vector, work_depth2::Vector, position::Int)
-    rho = computeProjection!(work, work2, work_depth, work_depth2, x, Q)    
+    rho = computeProjection!(work, work2, work_depth, work_depth2, x, Q, it.reorthogonalization_factor)    
     
     copy!(view(Q,:,position), work)
     copy!(view(R,:,position), work_depth)
