@@ -4,6 +4,11 @@ using LinearAlgebra:norm
 using TimerOutputs
 export aar, aar!, AARIterable, aar_terator!
 
+mutable struct State
+    ORTH::String  # "" or "O", used for output
+    ITER_TYPE::String # R or A, used for output
+end
+
 mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     A::matT
     Q::Matrix # Dense, so we hard-code the type
@@ -31,6 +36,7 @@ mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     omega::Real
     beta::Real
     reorthogonalization_factor::Real
+    state::State
 end
 
 
@@ -53,36 +59,8 @@ function appendColumnToMatrix!(A::Matrix, v::Vector, iteration::Int, depth::Int)
 end
 
 
-
-# work=(I - Q Q')x, work_depth=Q'x
-function computeProjectionStep!(work::Vector, work_depth::Vector, x::Vector, Q::Matrix)
-    mul!(work_depth, Q', x)
-    mul!(work, Q, work_depth) 
-    axpby!(1.0, x, -1.0, work) 
-end
-
-
-# projection is stored in work, new column of R is stored in work_depth
-# See Daniel, Gragg, Kaufman, Stewart. Mathematics of Computation (1976).
-function computeProjection!(work::Vector, work2::Vector, work_depth::Vector, work_depth2::Vector, x::Vector, Q::Matrix, reorthogonalization_factor::Real)
-    norm_prev = norm(x)
-    computeProjectionStep!(work, work_depth, x, Q) 
-    norm_current = norm(work)
-    its = 0
-    while norm_current < reorthogonalization_factor * norm_prev && its < 20 # Hard limit
-        norm_prev = norm(work)
-        computeProjectionStep!(work2, work_depth2, work, Q) # work is previous solution, we project that one into work2
-        axpy!(1.0, work_depth2, work_depth) # We add increment of projection
-        norm_current = norm(work2)
-        copy!(work, work2)
-        its +=1
-    end
-    normalize!(work)
-    norm_current
-end
-
 # x<-(I - Q Q')x, work_depth=Q'x
-function computeProjectionStep_agg!(x::Vector, work::Vector, work_depth::Vector, Q::Matrix)
+function computeProjectionStep!(x::Vector, work::Vector, work_depth::Vector, Q::Matrix)
     mul!(work_depth, Q', x)
     mul!(work, Q, work_depth) 
     axpy!(-1.0, work, x) 
@@ -90,45 +68,32 @@ end
 
 # projection is stored in work, new column of R is stored in work_depth
 # See Daniel, Gragg, Kaufman, Stewart. Mathematics of Computation (1976).
-function computeProjection_agg!(x::Vector, work::Vector, work_depth::Vector, work_depth2::Vector, Q::Matrix, reorthogonalization_factor::Real)
-    computeProjectionStep_agg!(x, work, work_depth, Q) # x <- Px, w_depth = Q'x
+function computeProjection!(x::Vector, work::Vector, work_depth::Vector, work_depth2::Vector, Q::Matrix, reorthogonalization_factor::Real, state::State)
     norm_prev = norm(x)
-    norm_current = 0.0
+    computeProjectionStep!(x, work, work_depth, Q) # x <- Px, w_depth = Q'x
+    norm_current = norm(x)
     its = 1
-    while reorthogonalization_factor > 0.0
-        computeProjectionStep_agg!(x, work, work_depth2, Q) # x is previous solution, we update it
-        axpy!(1.0, work_depth2, work_depth) # We add increment of projection
+    state.ORTH = ""
+    while norm_current < reorthogonalization_factor * norm_prev && its < 20
+        norm_prev = norm(x)
+        computeProjectionStep!(x, work, work_depth2, Q) # x is previous solution, we update it
         norm_current = norm(x)
-	if ! (norm_current < reorthogonalization_factor * norm_prev && its < 20) # 20 is hard limit
-	    normalize!(x)
-	    return norm_current
-	end
-	norm_prev = norm(x)
+        axpy!(1.0, work_depth2, work_depth) # We add increment of projection
         its += 1
+	state.ORTH = "O"
     end
     normalize!(x)
-    norm_prev
-end
-
-
-# Note: x does not change
-function append_column!(Q::Matrix, R::Matrix, x::Vector, work::Vector, work2::Vector, work_depth::Vector, work_depth2::Vector, position::Int, reorthogonalization_factor)
-    rho = computeProjection!(work, work2, work_depth, work_depth2, x, Q, reorthogonalization_factor)    
-    # Copy work into last Q col, work_depth into R
-    copy!(view(Q,:,position), work)
-    copy!(view(R,1:position-1,position), view(work_depth,1:position-1))
-    @inbounds R[position, position] = rho
+    norm_current
 end
 
 # Aggressive in the sense that the added vector gets overwritten to save one vector allocation.
-function append_column_agg!(Q::Matrix, R::Matrix, x::Vector, work::Vector, work_depth::Vector, work_depth2::Vector, position::Int, reorthogonalization_factor)
-    rho = computeProjection_agg!(x, work, work_depth, work_depth2, Q, reorthogonalization_factor)    
+function append_column!(Q::Matrix, R::Matrix, x::Vector, work::Vector, work_depth::Vector, work_depth2::Vector, position::Int, reorthogonalization_factor::Float64, state::State)
+    rho = computeProjection!(x, work, work_depth, work_depth2, Q, reorthogonalization_factor, state)    
     # Copy work into last Q col, work_depth into R
     copy!(view(Q,:,position), x)
     copy!(view(R,1:position-1,position), view(work_depth,1:position-1))
     @inbounds R[position, position] = rho
 end
-
 
 
 function solve_R!(R::Matrix, b::Vector, sol::Vector, realSize::Int64)
@@ -182,7 +147,7 @@ function computeResidual!(it::AARIterable, x::vecT, result::vecT, work::vecT, wo
     res_norm
 end
 
-function updateQR!(it::AARIterable, iteration::Int, mk::Int)
+function updateQR!(it::AARIterable, iteration::Int, mk::Int, state::State)
     #@timeit "QR: Remove" begin
     iteration > it.depth && remove_first_column!(it.Q, it.R)
     #end # timeit QR Remove
@@ -194,7 +159,7 @@ function updateQR!(it::AARIterable, iteration::Int, mk::Int)
     axpy!(it.beta, it.work, view(it.XF,:,mk)) # Set X <- X + beta F
     #end # timeit QR Copy
     #@timeit "QR: Append" begin
-    append_column_agg!(it.Q, it.R, it.work, it.work2, it.work_depth, it.work_depth2, mk, it.reorthogonalization_factor) # Work (arg 3) DOES change
+    append_column!(it.Q, it.R, it.work, it.work2, it.work_depth, it.work_depth2, mk, it.reorthogonalization_factor, state) # Work (arg 3) DOES change
     #end # timeit QR Append
 end
 
@@ -233,7 +198,7 @@ function iterate(it::AARIterable, iteration::Int=start(it))
     # Update QR factorization
     mk = min(iteration, it.depth)
     if iteration > 0
-        updateQR!(it, iteration, mk)
+        updateQR!(it, iteration, mk, it.state)
     end
     #end #timeit Update QR
 
@@ -241,10 +206,12 @@ function iterate(it::AARIterable, iteration::Int=start(it))
         #@timeit  "Richardson" begin
         # Richardson step
 	axpy!(it.omega, it.r, it.x)
+	it.state.ITER_TYPE = "R"
         #end #timeit Richardson
     else
         #@timeit  "Anderson" begin
         andersonStep!(it, mk)
+	it.state.ITER_TYPE = "A"
         #end #timeit Anderson
     end
 
@@ -297,8 +264,9 @@ function aar_iterator!(x, A, b, Pl = Identity(), Pr = Identity();
     weights = zeros(size(work_depth))
     XF = zeros(size(Q))
     prev_residual = 1.0
+    state = State("", "R")
 
-    AARIterable(A, Q, R, x, b, Pl, Pr, r, work, work2, work_depth, work_depth2, weights, r_prev, x_prev, XF, tolerance, residual, prev_residual, maxiter, mv_products, depth, p, omega, beta, reorthogonalization_factor)
+    AARIterable(A, Q, R, x, b, Pl, Pr, r, work, work2, work_depth, work_depth2, weights, r_prev, x_prev, XF, tolerance, residual, prev_residual, maxiter, mv_products, depth, p, omega, beta, reorthogonalization_factor, state)
 
 end
 
@@ -384,7 +352,7 @@ function aar!(x, A, b;
             nextiter!(history, mvps = 1)
             push!(history, :resnorm, iterable.residual)
         end
-        verbose && @printf("%3d\t%1.2e\n", iteration, iterable.residual)
+        verbose && @printf("%s %3d\t%1.2e %s\n", iterable.state.ITER_TYPE, iteration, iterable.residual, iterable.state.ORTH)
     end
     #end # timeit SOLVE
 
