@@ -37,21 +37,17 @@ end
 function appendColumnToMatrix!(A::Matrix, v::Vector, iteration::Int, depth::Int)
     if iteration > depth
         #@timeit "Copy 1" begin
+	# For some reason, copy is slower inside the for loop.
         for i in 2:size(A, 2), j in 1:size(A, 1)
             @inbounds A[j, i-1] = A[j, i]
 	    #copy!(view(A,:,i-1), view(A,:,i))
 	end
-        for j in 1:size(A, 1)
-            @inbounds A[j, size(A,2)] = v[j]
-        end
-	#copy!(view(A,:,size(A,2)), v)
+	#A[:,depth] .= v
+	copy!(view(A,:,size(A,2)), v)
         #end # timeit Copy 1
     else
         #@timeit "Copy 2" begin
-        for j in 1:size(A, 1)
-            @inbounds A[j, iteration] = v[j]
-        end
-	#copy!(view(A,:,iteration), v)
+	copy!(view(A,:,iteration), v)
         #end # timeit Copy 2
     end
 end
@@ -85,25 +81,33 @@ function computeProjection!(work::Vector, work2::Vector, work_depth::Vector, wor
     norm_current
 end
 
+# x<-(I - Q Q')x, work_depth=Q'x
+function computeProjectionStep_agg!(x::Vector, work::Vector, work_depth::Vector, Q::Matrix)
+    mul!(work_depth, Q', x)
+    mul!(work, Q, work_depth) 
+    axpy!(-1.0, work, x) 
+end
+
 # projection is stored in work, new column of R is stored in work_depth
 # See Daniel, Gragg, Kaufman, Stewart. Mathematics of Computation (1976).
 function computeProjection_agg!(x::Vector, work::Vector, work_depth::Vector, work_depth2::Vector, Q::Matrix, reorthogonalization_factor::Real)
+    computeProjectionStep_agg!(x, work, work_depth, Q) # x <- Px, w_depth = Q'x
     norm_prev = norm(x)
-    copy!(work, x) # To avoid an allocation, we incur on an extra copy.
-    computeProjectionStep!(x, work_depth, work, Q) # x <- Px, w_depth = Q'x
-    norm_current = norm(x)
-    its = 0
-    while norm_current < reorthogonalization_factor * norm_prev && its < 20 # Hard limit
-        #println("Orthogonalized!")
-        norm_prev = norm(x)
-        computeProjectionStep!(x, work_depth2, work, Q) # x is previous solution, we update it
+    norm_current = 0.0
+    its = 1
+    while reorthogonalization_factor > 0.0
+        computeProjectionStep_agg!(x, work, work_depth2, Q) # x is previous solution, we update it
         axpy!(1.0, work_depth2, work_depth) # We add increment of projection
         norm_current = norm(x)
-        copy!(work, x)
+	if ! (norm_current < reorthogonalization_factor * norm_prev && its < 20) # 20 is hard limit
+	    normalize!(x)
+	    return norm_current
+	end
+	norm_prev = norm(x)
         its += 1
     end
     normalize!(x)
-    norm_current
+    norm_prev
 end
 
 
@@ -111,14 +115,8 @@ end
 function append_column!(Q::Matrix, R::Matrix, x::Vector, work::Vector, work2::Vector, work_depth::Vector, work_depth2::Vector, position::Int, reorthogonalization_factor)
     rho = computeProjection!(work, work2, work_depth, work_depth2, x, Q, reorthogonalization_factor)    
     # Copy work into last Q col, work_depth into R
-    for j in 1:size(Q,1)
-        @inbounds Q[j,position] = work[j]
-    end  
-    for j in 1:(position-1)
-        @inbounds R[j,position] = work_depth[j]
-    end  
-    #copy!(view(Q,:,position), work)
-    #copy!(view(R,:,position), work_depth)
+    copy!(view(Q,:,position), work)
+    copy!(view(R,1:position-1,position), view(work_depth,1:position-1))
     @inbounds R[position, position] = rho
 end
 
@@ -126,14 +124,8 @@ end
 function append_column_agg!(Q::Matrix, R::Matrix, x::Vector, work::Vector, work_depth::Vector, work_depth2::Vector, position::Int, reorthogonalization_factor)
     rho = computeProjection_agg!(x, work, work_depth, work_depth2, Q, reorthogonalization_factor)    
     # Copy work into last Q col, work_depth into R
-    for j in 1:size(Q,1)
-        @inbounds Q[j,position] = x[j]
-    end  
-    for j in 1:(position-1)
-        @inbounds R[j,position] = work_depth[j]
-    end  
-    #copy!(view(Q,:,position), x)
-    #copy!(view(R,:,position), work_depth)
+    copy!(view(Q,:,position), x)
+    copy!(view(R,1:position-1,position), view(work_depth,1:position-1))
     @inbounds R[position, position] = rho
 end
 
@@ -143,11 +135,11 @@ function solve_R!(R::Matrix, b::Vector, sol::Vector, realSize::Int64)
     # Note: R is upper triangular
     @inbounds sol[realSize] = b[realSize] / R[realSize, realSize]
     for i in (realSize-1):-1:1
-	@inbounds sol[i] = b[i]
-	for j in realSize:-1:(i+1)
-	    @inbounds sol[i] = sol[i] - R[i,j] * sol[j]
-	end
-	@inbounds sol[i] = sol[i] / R[i,i]
+        @inbounds sol[i] = b[i]
+        for j in realSize:-1:(i+1)
+            @inbounds sol[i] = sol[i] - R[i,j] * sol[j]
+        end
+        @inbounds sol[i] = sol[i] / R[i,i]
     end
 end
 
