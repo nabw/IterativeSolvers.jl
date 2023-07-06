@@ -1,7 +1,7 @@
 import Base: iterate
 using Printf
 using LinearAlgebra:norm
-using TimerOutputs
+#using TimerOutputs
 export aar, aar!, AARIterable, aar_terator!
 
 mutable struct State
