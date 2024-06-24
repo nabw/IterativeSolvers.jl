@@ -2,7 +2,7 @@ import Base: iterate
 using Printf
 using LinearAlgebra:norm
 #using TimerOutputs
-export aar, aar!, AARIterable, aar_terator!
+export aar, aar!, AARIterable, aar_iterator!
 
 mutable struct State
     ORTH::String  # "" or "O", used for output
@@ -41,16 +41,21 @@ end
 
 
 function appendColumnToMatrix!(A::Matrix, v::Vector, iteration::Int, depth::Int)
+    """
+    Append vector 'v' to the last column of matrix 'A'. The other parameters are required
+    because, during its first iterations, AAR does not reach all columns. Memory is allocated
+    at the beginning, and then the matrix is filled as required.
+    """
     if iteration > depth
         #@timeit "Copy 1" begin
-	# For some reason, copy is slower inside the for loop.
+        # For some reason, copy is slower inside the for loop.
         for i in 2:size(A, 2), j in 1:size(A, 1)
             @inbounds A[j, i-1] = A[j, i]
 	    #copy!(view(A,:,i-1), view(A,:,i))
 	end
 	#A[:,depth] .= v
 	copy!(view(A,:,size(A,2)), v)
-        #end # timeit Copy 1
+    #end # timeit Copy 1
     else
         #@timeit "Copy 2" begin
 	copy!(view(A,:,iteration), v)
@@ -69,21 +74,29 @@ end
 # projection is stored in work, new column of R is stored in work_depth
 # See Daniel, Gragg, Kaufman, Stewart. Mathematics of Computation (1976).
 function computeProjection!(x::Vector, work::Vector, work_depth::Vector, work_depth2::Vector, Q::Matrix, reorthogonalization_factor::Real, state::State)
-    norm_prev = norm(x)
-    computeProjectionStep!(x, work, work_depth, Q) # x <- Px, w_depth = Q'x
-    norm_current = norm(x)
-    its = 1
-    state.ORTH = ""
-    while norm_current < reorthogonalization_factor * norm_prev && its < 20
+    """
+    The outputs of this function are: 
+    - x -> x - Q Q.T x
+    - work_depth -> Q.T x
+    """
+    if reorthogonalization_factor > 0.0
         norm_prev = norm(x)
-        computeProjectionStep!(x, work, work_depth2, Q) # x is previous solution, we update it
-        norm_current = norm(x)
-        axpy!(1.0, work_depth2, work_depth) # We add increment of projection
-        its += 1
-	state.ORTH = "O"
-    end
-    normalize!(x)
-    norm_current
+        computeProjectionStep!(x, work, work_depth, Q) # x <- Px, w_depth = Q'x
+        its = 1
+        state.ORTH = ""
+        while norm_prev < reorthogonalization_factor * norm(x) && its < 20
+            norm_prev = norm(x)
+            computeProjectionStep!(x, work, work_depth2, Q) # x is previous solution, we update it
+            axpy!(1.0, work_depth2, work_depth) # We add increment of projection
+            its += 1
+        end
+        state.ORTH = its>1 && "O"
+        normalize!(x)
+        norm_current
+    else
+        computeProjectionStep!(x, work, work_depth, Q) # x <- Px, w_depth = Q'x
+        normalize!(x)
+        norm(x)
 end
 
 # Aggressive in the sense that the added vector gets overwritten to save one vector allocation.
@@ -118,8 +131,8 @@ function remove_first_column!(Q::Matrix, R::Matrix)
     # Compute rotations and use then
     for i in 1:(size(R, 2) - 1) # Last is already null
         g, r = givens(R, i, i+1, i)
-	lmul!(g, R)
-	rmul!(Q, g')
+        lmul!(g, R)
+        rmul!(Q, g')
     end
     #triu!(R) # Lower part never accessed, so leaving commented
     @inbounds Q[:,size(Q, 2)] .= 0.0 # Last column disappears
@@ -205,13 +218,13 @@ function iterate(it::AARIterable, iteration::Int=start(it))
     if (iteration+1) % it.p != 0 || iteration == 0
         #@timeit  "Richardson" begin
         # Richardson step
-	axpy!(it.omega, it.r, it.x)
-	it.state.ITER_TYPE = "R"
+        axpy!(it.omega, it.r, it.x)
+        it.state.ITER_TYPE = "R"
         #end #timeit Richardson
     else
         #@timeit  "Anderson" begin
         andersonStep!(it, mk)
-	it.state.ITER_TYPE = "A"
+        it.state.ITER_TYPE = "A"
         #end #timeit Anderson
     end
 
