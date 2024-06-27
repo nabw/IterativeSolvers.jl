@@ -1,31 +1,39 @@
 import Base: iterate
 using Printf
 using LinearAlgebra:norm
-#using TimerOutputs
-export aar, aar!, AARIterable, aar_iterator!
+using QRupdate
+import QRupdate: solveR!, solveRT!
+using TimerOutputs
+export aar, aar!, AARIterable, aar_iterator!, appendColumn!
 
 mutable struct State
     ORTH::String  # "" or "O", used for output
     ITER_TYPE::String # R or A, used for output
 end
 
+mutable struct QRaar{matT, Int}
+    R::matT
+    size::Int
+end
+
 mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     A::matT
-    Q::Matrix # Dense, so we hard-code the type
-    R::Matrix # Dense, so we hard-code the type
+    qr::QRaar # Dense, so we hard-code the type
     x::solT
     b::vecT
     Pl::preclT
     Pr::precrT
     r::vecT
     work::vecT
-    work2::vecT
     work_depth::vecT
     work_depth2::vecT
+    work_depth3::vecT
+    work_depth4::vecT
     weights::vecT
-    r_prev::vecT
-    x_prev::solT
-    XF::Matrix 
+    dr::vecT
+    dx::solT
+    X::Matrix 
+    F::Matrix 
     tol::numT
     residual::numT
     prev_residual::numT
@@ -34,109 +42,23 @@ mutable struct AARIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     depth::Int
     p::Int
     omega::Real
-    beta::Real
-    reorthogonalization_factor::Real
     state::State
 end
 
 
-function appendColumnToMatrix!(A::Matrix, v::Vector, iteration::Int, depth::Int)
-    """
-    Append vector 'v' to the last column of matrix 'A'. The other parameters are required
-    because, during its first iterations, AAR does not reach all columns. Memory is allocated
-    at the beginning, and then the matrix is filled as required.
-    """
+
+function appendColumn!(A::Matrix{T}, v::Vector{T}, iteration::Int, depth::Int) where {T}
     if iteration > depth
-        #@timeit "Copy 1" begin
-        # For some reason, copy is slower inside the for loop.
-        for i in 2:size(A, 2), j in 1:size(A, 1)
-            @inbounds A[j, i-1] = A[j, i]
-	    #copy!(view(A,:,i-1), view(A,:,i))
-	end
-	#A[:,depth] .= v
-	copy!(view(A,:,size(A,2)), v)
-    #end # timeit Copy 1
-    else
-        #@timeit "Copy 2" begin
-	copy!(view(A,:,iteration), v)
-        #end # timeit Copy 2
-    end
-end
-
-
-# x<-(I - Q Q')x, work_depth=Q'x
-function computeProjectionStep!(x::Vector, work::Vector, work_depth::Vector, Q::Matrix)
-    mul!(work_depth, Q', x)
-    mul!(work, Q, work_depth) 
-    axpy!(-1.0, work, x) 
-end
-
-# projection is stored in work, new column of R is stored in work_depth
-# See Daniel, Gragg, Kaufman, Stewart. Mathematics of Computation (1976).
-function computeProjection!(x::Vector, work::Vector, work_depth::Vector, work_depth2::Vector, Q::Matrix, reorthogonalization_factor::Real, state::State)
-    """
-    The outputs of this function are: 
-    - x -> x - Q Q.T x
-    - work_depth -> Q.T x
-    """
-    if reorthogonalization_factor > 0.0
-        norm_prev = norm(x)
-        computeProjectionStep!(x, work, work_depth, Q) # x <- Px, w_depth = Q'x
-        its = 1
-        state.ORTH = ""
-        while norm_prev < reorthogonalization_factor * norm(x) && its < 20
-            norm_prev = norm(x)
-            computeProjectionStep!(x, work, work_depth2, Q) # x is previous solution, we update it
-            axpy!(1.0, work_depth2, work_depth) # We add increment of projection
-            its += 1
+        n = size(A,2)
+        for i in 2:n
+            A[:,i-1] .= @view A[:,i]
         end
-        state.ORTH = its>1 && "O"
-        normalize!(x)
-        norm_current
+        A[:,n] .= v
     else
-        computeProjectionStep!(x, work, work_depth, Q) # x <- Px, w_depth = Q'x
-        normalize!(x)
-        norm(x)
-end
-
-# Aggressive in the sense that the added vector gets overwritten to save one vector allocation.
-function append_column!(Q::Matrix, R::Matrix, x::Vector, work::Vector, work_depth::Vector, work_depth2::Vector, position::Int, reorthogonalization_factor::Float64, state::State)
-    rho = computeProjection!(x, work, work_depth, work_depth2, Q, reorthogonalization_factor, state)    
-    # Copy work into last Q col, work_depth into R
-    copy!(view(Q,:,position), x)
-    copy!(view(R,1:position-1,position), view(work_depth,1:position-1))
-    @inbounds R[position, position] = rho
-end
-
-
-function solve_R!(R::Matrix, b::Vector, sol::Vector, realSize::Int64)
-    # Note: R is upper triangular
-    @inbounds sol[realSize] = b[realSize] / R[realSize, realSize]
-    for i in (realSize-1):-1:1
-        @inbounds sol[i] = b[i]
-        for j in realSize:-1:(i+1)
-            @inbounds sol[i] = sol[i] - R[i,j] * sol[j]
-        end
-        @inbounds sol[i] = sol[i] / R[i,i]
+        A[:,iteration] .= v
     end
 end
 
-function remove_first_column!(Q::Matrix, R::Matrix)
-    # Shift R
-    for j in 2:size(R, 2), i in 1:size(R, 1)
-        @inbounds R[i,j-1] = R[i, j]
-	#copy!(view(R,:,j-1), view(R,:,j))
-    end
-    @inbounds R[:,size(R,2)] .= 0.0
-    # Compute rotations and use then
-    for i in 1:(size(R, 2) - 1) # Last is already null
-        g, r = givens(R, i, i+1, i)
-        lmul!(g, R)
-        rmul!(Q, g')
-    end
-    #triu!(R) # Lower part never accessed, so leaving commented
-    @inbounds Q[:,size(Q, 2)] .= 0.0 # Last column disappears
-end 
 
 @inline converged(it::AARIterable) = it.residual ≤ it.tol
 
@@ -144,51 +66,30 @@ end
 
 @inline done(it::AARIterable, iteration::Int) = iteration ≥ it.maxiter || converged(it)
 
-# Apply matrix A to x. AARIt is used to obtain A, Pr. 
-function applyA!(it::AARIterable, x::vecT, work::vecT, result::vecT) where vecT
-    ldiv!(work, it.Pr, x)
-    mul!(result, it.A, work)
-end
-
 # Compute residual b - Ax and return unpreconditioned norm. AARIt is used to obtain A, Pr and b. 
-function computeResidual!(it::AARIterable, x::vecT, result::vecT, work::vecT, work2::vecT) where vecT
-    applyA!(it, x, work, work2) # Result in work2
-    copy!(result, it.b)
-    axpy!(-1.0, work2, result) # result = b - Ax
+function computeResidual!(it::AARIterable, x::vecT, result::vecT, work::vecT) where vecT
+    # Apply A
+    ldiv!(it.work, it.Pr, x) # work <- Pr x
+    copy!(result, it.b) # result <- b
+    mul!(result, it.A, it.work, -1, 1) # result = b - Ax
+
     res_norm = norm(result) 
     ldiv!(it.Pl, result) # result = Pl(b-Ax)
     res_norm
 end
 
-function updateQR!(it::AARIterable, iteration::Int, mk::Int, state::State)
-    #@timeit "QR: Remove" begin
-    iteration > it.depth && remove_first_column!(it.Q, it.R)
-    #end # timeit QR Remove
-    
-    # Add r - r_prev to QR
-    #@timeit "QR: Copy" begin
-    copy!(it.work, it.r)
-    axpy!(-1.0, it.r_prev, it.work) # work = r - r_prev
-    axpy!(it.beta, it.work, view(it.XF,:,mk)) # Set X <- X + beta F
-    #end # timeit QR Copy
-    #@timeit "QR: Append" begin
-    append_column!(it.Q, it.R, it.work, it.work2, it.work_depth, it.work_depth2, mk, it.reorthogonalization_factor, state) # Work (arg 3) DOES change
-    #end # timeit QR Append
-end
-
 function andersonStep!(it::AARIterable, mk::Int)
     #@timeit  "Anderson weights" begin
-    # Anderson step
-    mul!(it.work_depth, it.Q', it.r) 
-    solve_R!(it.R, it.work_depth, it.weights, mk)
-    #end #timeit
+    # Anderson step, weights are updated here.
+    csne!(it.qr.R, it.F, it.r, it.work, it.work_depth, it.work_depth2, it.weights, it.qr.size)
+    #end #timeit "Anderson weights"
 
     #@timeit  "Anderson update" begin
-    # Now we do x <- x + beta * r - (X + beta F) weights
-    mul!(it.work, it.XF, it.weights)
-    axpy!(-1.0, it.work, it.x) 
-    axpy!(it.beta, it.r, it.x) 
-    #end #timeit
+    # Now we do x <- x + r - (X + F) weights
+    axpy!(1, it.r, it.x)
+    mul!(it.x, it.X, it.weights, -1, 1)
+    mul!(it.x, it.F, it.weights, -1, 1)
+    #end #timeit "Anderson update"
 
 end
 
@@ -197,9 +98,14 @@ end
 ###############
 
 function iterate(it::AARIterable, iteration::Int=start(it))
+
+    mk = min(iteration, it.depth)
+
     # Compute current residual
     #@timeit "Compute residual" begin
-    it.residual = computeResidual!(it, it.x, it.r, it.work, it.work2)
+    copy!(it.dr, it.r)
+    it.residual = computeResidual!(it, it.x, it.r, it.work)
+    axpby!(1, it.r, -1, it.dr) # dr = r - r_prev
     #end # timeit Compute residual
 
     # Check for termination first
@@ -207,42 +113,46 @@ function iterate(it::AARIterable, iteration::Int=start(it))
         return nothing
     end
 
-    #@timeit "Update QR" begin
-    # Update QR factorization
-    mk = min(iteration, it.depth)
+    # Update QR factorization of F and X
+    #@timeit "Update Mats" begin
     if iteration > 0
-        updateQR!(it, iteration, mk, it.state)
-    end
-    #end #timeit Update QR
+        # Always remove the first one (oldest iteration)
+        if iteration > it.depth  
+            #@timeit "QR downdate" begin
+                qrdelcol!(it.F, it.qr.R, 1) 
+                it.qr.size -= 1
+            #end # timeit QR downdate
+        end
+        
+        # Add dx to X
+        #@timeit "X update" begin
+            appendColumn!(it.X, it.dx, iteration, it.depth)
+        #end # timeit X update
 
+        # Update QR
+        #@timeit "QR update" begin
+            qraddcol!(it.F, it.qr.R, it.dr, it.qr.size, it.work_depth, it.work_depth2, it.work_depth3, it.work_depth4, it.work)
+            it.qr.size += 1
+        #end # timeit QR Append
+    end # if iteration > 0
+    #end #timeit Update Mats
+
+    copy!(it.dx, it.x)
+    # Iterate for new x
     if (iteration+1) % it.p != 0 || iteration == 0
         #@timeit  "Richardson" begin
-        # Richardson step
-        axpy!(it.omega, it.r, it.x)
-        it.state.ITER_TYPE = "R"
+            axpy!(it.omega, it.r, it.x)
+            it.state.ITER_TYPE = "R"
         #end #timeit Richardson
     else
         #@timeit  "Anderson" begin
-        andersonStep!(it, mk)
-        it.state.ITER_TYPE = "A"
+            andersonStep!(it, mk)
+            it.state.ITER_TYPE = "A"
         #end #timeit Anderson
     end
+    axpby!(1.0, it.x, -1, it.dx) # dx = x - x_previous
 
-    # This is X, indexing follows the same previous logic.
-    #@timeit "Update X" begin
-    idx = (iteration % it.depth) + 1
-    copy!(it.work, it.x)
-    axpy!(-1.0, it.x_prev, it.work)
-    #@timeit "Update X: Append" begin
-    appendColumnToMatrix!(it.XF, it.work, iteration+1, it.depth)
-    #end # timeit Append
-    #end #timeit Update X
-
-    #@timeit "Finishing copies" begin
-    copy!(it.x_prev, it.x)
-    copy!(it.r_prev, it.r) 
     it.prev_residual = it.residual
-    #end #timeit Finishing
 
     # Return the residual at item and iteration number as state
     it.residual, iteration + 1
@@ -257,29 +167,31 @@ function aar_iterator!(x, A, b, Pl = Identity(), Pr = Identity();
                       depth::Int=1,  
                       p::Int=1,  
                       omega::Real=1.0, 
-                      beta::Real=1.0,
                       reorthogonalization_factor::Real=0.0)
-    r = copy(b)
-
-    mv_products=0
+    
+    r = - b + A*x  # - b + A x0
+    mv_products = 0
     residual = norm(r)
     tolerance = max(reltol * residual, abstol)
-    x_prev = copy(x)
-    r_prev = copy(r)
+    axpy!(1, r, x) # x1 = x0 + r0
+    dx = copy(r) # x1 - x0 = r0
+    dr = copy(r) # random
 
     # Return the iterable
-    Q = zeros(size(A,1),depth)
     R = zeros(depth,depth)
+    qr = QRaar(R, 0)
     work = similar(x)
-    work2 = similar(x)
+    weights = zeros(depth)
     work_depth = zeros(depth)
     work_depth2 = similar(work_depth)
-    weights = zeros(size(work_depth))
-    XF = zeros(size(Q))
+    work_depth3 = similar(work_depth)
+    work_depth4 = similar(work_depth)
+    X = zeros(size(A,1),depth)
+    F = zeros(size(A,1),depth)
     prev_residual = 1.0
     state = State("", "R")
 
-    AARIterable(A, Q, R, x, b, Pl, Pr, r, work, work2, work_depth, work_depth2, weights, r_prev, x_prev, XF, tolerance, residual, prev_residual, maxiter, mv_products, depth, p, omega, beta, reorthogonalization_factor, state)
+    AARIterable(A, qr, x, b, Pl, Pr, r, work, work_depth, work_depth2, work_depth3, work_depth4, weights, dr, dx, X, F, tolerance, residual, prev_residual, maxiter, mv_products, depth, p, omega, state)
 
 end
 
@@ -339,10 +251,9 @@ function aar!(x, A, b;
              verbose::Bool = false,
              Pl = Identity(),
              Pr = Identity(),
-	     depth::Int = 10,
-	     p::Int = 5,
-	     omega::Real = 1.0,
-	     beta::Real = 1.0,
+             depth::Int = 10,
+             p::Int = 5,
+             omega::Real = 1.0,
              kwargs...)
     #@timeit "All" begin
     history = ConvergenceHistory(partial = !log)
@@ -354,7 +265,7 @@ function aar!(x, A, b;
     # Actually perform AAR
     #@timeit "create iter" begin
     iterable = aar_iterator!(x, A, b, Pl, Pr; abstol = abstol, reltol = reltol, maxiter = maxiter,
-                            depth = depth, p = p, omega = omega, beta = beta, kwargs...)
+                            depth = depth, p = p, omega = omega, kwargs...)
     #end #timeit create iter
     if log
         history.mvps = iterable.mv_products
@@ -365,7 +276,7 @@ function aar!(x, A, b;
             nextiter!(history, mvps = 1)
             push!(history, :resnorm, iterable.residual)
         end
-        verbose && @printf("%s %3d\t%1.2e %s\n", iterable.state.ITER_TYPE, iteration, iterable.residual, iterable.state.ORTH)
+        verbose && @printf("%s %3d\t%1.2e\n", iterable.state.ITER_TYPE, iteration, iterable.residual)
     end
     #end # timeit SOLVE
 

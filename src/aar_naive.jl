@@ -1,24 +1,22 @@
 import Base: iterate
 using Printf
 using LinearAlgebra:norm
+import QRupdate: solveR!
 #using TimerOutputs
-export aar_naive, aar_naive!, AARNIterable, aar_iterator!, AARNStateVariables
+export aar_naive, aar_naive!, AARNIterable, aar_iterator!
 
 mutable struct AARNIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     A::matT
-    Q::Matrix # Dense, so we hard-code the type
-    R::Matrix # Dense, so we hard-code the type
     x::solT
     b::vecT
     Pl::preclT
     Pr::precrT
     r::vecT
-    u::vecT
     work::vecT
-    work2::vecT
+    work_depth::vecT
     weights::vecT
     r_prev::vecT
-    u_prev::solT
+    x_prev::solT
     F::Matrix
     X::Matrix
     tol::numT
@@ -29,7 +27,7 @@ mutable struct AARNIterable{matT, preclT, precrT, solT, vecT, numT <: Real}
     depth::Int
     p::Int
     omega::Real
-    beta::Real
+    state::State
 end
 
 @inline converged(it::AARNIterable) = it.residual ≤ it.tol
@@ -39,32 +37,23 @@ end
 @inline done(it::AARNIterable, iteration::Int) = iteration ≥ it.maxiter || converged(it)
 
 
-function appendColumn!(A::Matrix, v::Vector, iteration::Int, depth::Int)
-    if iteration > depth
-        for i in 2:size(A, 2)
-	    A[:,i-1] .= @view A[:,i]
-	end
-	A[:,size(A,2)] .= v
-    else
-	A[:,iteration] .= v
-    end
-end
-
 ###############
 # Ordinary AAR #
 ###############
 
 function iterate(it::AARNIterable, iteration::Int=start(it))
+
+    mk = min(iteration, it.depth)
+
     # Compute current residual
-    ldiv!(it.work, it.Pr, it.u)
-    mul!(it.work2, it.A, it.work)
-    it.r .= it.b 
-    axpy!(-1.0, it.work2, it.r)
+    it.prev_residual = it.residual
+    it.r_prev .= it.r
+    ldiv!(it.work, it.Pr, it.x)
+    copy!(it.r, it.b)
+    mul!(it.r, it.A, it.work, -1, 1)
+    it.residual = norm(it.r)
 
     # Check for termination first
-    maxit = it.maxiter
-    res = it.residual
-    tole = it.tol
     if done(it, iteration)
         return nothing
     end
@@ -73,37 +62,35 @@ function iterate(it::AARNIterable, iteration::Int=start(it))
     # but original one for computing errors
     ldiv!(it.Pl, it.r) 
 
-    # Update F matrix
-    mk = min(iteration, it.depth)
     if iteration > 0
-	it.work .= it.r
-	axpy!(-1.0, it.r_prev, it.work) # work = r - r_prev
-	appendColumn!(it.F, it.work, iteration, it.depth)
+        # Update F matrix
+        it.work .= it.r
+        axpy!(-1.0, it.r_prev, it.work) # work = r - r_prev
+        appendColumn!(it.F, it.work, iteration, it.depth)
+
+        # Update X matrix
+        it.work .= it.x
+        axpy!(-1.0, it.x_prev, it.work)
+        appendColumn!(it.X, it.work, iteration, it.depth)
     end
 
+    it.x_prev .= it.x
     if (iteration+1) % it.p != 0 || iteration == 0
-	axpy!(it.omega, it.r, it.u)
+        axpy!(it.omega, it.r, it.x)
+        it.state.ITER_TYPE = "R"
     else
-	ldiv!(it.weights, svd(it.F), it.r)
-	axpy!(it.beta, it.r, it.u)
-	for i in 1:mk
-	    xx = @view it.X[:,i]
-	    axpy!(-it.weights[i], xx, it.u)
-	    xx = @view it.F[:,i]
-	    axpy!(-it.weights[i], xx, it.u)
-	end
+        #qr_F = qr(it.F)
+        #mul!(it.work_depth, qr_F.Q.factors', it.r)
+        #solveR!(qr_F.R, it.work_depth, it.weights, mk)
+        ldiv!(it.weights, svd(it.F), it.r)
+        #it.weights = qr_F \ it.r
+        #ldiv!(it.weights, qr(it.F), it.r)
+        axpy!(1.0, it.r, it.x)
+        mul!(it.x, it.X, it.weights, -1, 1)
+        mul!(it.x, it.F, it.weights, -1, 1)
+        it.state.ITER_TYPE = "A"
     end
 
-    it.work .= it.u
-    axpy!(-1.0, it.u_prev, it.work)
-    itp1 = iteration + 1
-    appendColumn!(it.X, it.work, itp1, it.depth)
-
-
-    it.r_prev .= it.r
-    it.u_prev .= it.u
-    it.prev_residual = it.residual
-    it.residual = norm(it.r)
 
     # Return the residual at item and iteration number as state
     it.residual, iteration + 1
@@ -115,50 +102,31 @@ end
 
 # Utility functions
 
-"""
-Intermediate AAR state variables to be used inside aar and aar!. `u`, `r` and `c` should be of the same type as the solution of `aar` or `aar!`.
-```
-struct AARNStateVariables{T,Tx<:AbstractArray{T}}
-    u::Tx
-    r::Tx
-    c::Tx
-end
-```
-"""
-struct AARNStateVariables{T,Tx<:AbstractArray{T}}
-    u::Tx
-    r::Tx
-    c::Tx
-end
-
 function aarn_iterator!(x, A, b, Pl = Identity(), Pr = Identity();
                       abstol::Real = zero(real(eltype(b))),
                       reltol::Real = sqrt(eps(real(eltype(b)))),
                       maxiter::Int = size(A, 2),
-                      statevars::AARNStateVariables = AARNStateVariables(zero(x), similar(x), similar(x)), depth::Int=1, p::Int=1, omega::Real=1.0, beta::Real=1.0)
-    u = statevars.u
-    r = statevars.r
-    c = statevars.c
-    u .= x
-    copyto!(r, b)
+                      depth::Int=1, p::Int=1, omega::Real=1.0, beta::Real=1.0)
+    r = - b + A*x  # - b + A x0
+    axpy!(1, r, x) # x1 <- x0 + r0
 
     #mul!(c, A, x)
     mv_products=1
     residual = norm(r)
     tolerance = max(reltol * residual, abstol)
-    u_prev = copy(u)
+    x_prev = copy(x)
     r_prev = copy(r)
 
     # Return the iterable
-    Q = zeros(size(A,1),depth)
-    R = zeros(depth,depth)
     work = similar(x)
-    work2 = similar(x)
     weights = zeros(depth)
+    work_depth = zeros(depth)
     F = zeros(size(A, 1), depth)
     X = zeros(size(A, 1), depth)
     prev_residual = 1.0
-    AARNIterable(A, Q, R, x, b, Pl, Pr, r, u, work, work2, weights, r_prev, u_prev, F, X, tolerance, residual, prev_residual, maxiter, mv_products, depth, p, omega, beta)
+    state = State("", "R")
+
+    AARNIterable(A, x, b, Pl, Pr, r, work, work_depth, weights, r_prev, x_prev, F, X, tolerance, residual, prev_residual, maxiter, mv_products, depth, p, omega, state)
 
 end
 
@@ -180,7 +148,6 @@ aar_naive(A, b; kwargs...) = aar_naive!(zerox(A, b), A, b; kwargs...)
 
 ## Keywords
 
-- `statevars::AARStateVariables`: Has 3 arrays similar to `x` to hold intermediate results;
 - `Pl = Identity()`: left preconditioner of the method. Should be symmetric,
   positive-definite like `A`;
 - `abstol::Real = zero(real(eltype(b)))`,
@@ -216,23 +183,22 @@ function aar_naive!(x, A, b;
              reltol::Real = sqrt(eps(real(eltype(b)))),
              maxiter::Int = size(A, 2),
              log::Bool = false,
-             statevars::AARNStateVariables = AARNStateVariables(zero(x), similar(x), similar(x)),
              verbose::Bool = false,
              Pl = Identity(),
              Pr = Identity(),
-	     depth::Int = 5,
-	     p::Int = 1,
-	     omega::Real = 1.0,
-	     beta::Real = 1.0,
+             depth::Int = 5,
+             p::Int = 1,
+             omega::Real = 1.0,
              kwargs...)
     history = ConvergenceHistory(partial = !log)
     history[:abstol] = abstol
     history[:reltol] = reltol
+    verbose && @printf("=== aar-naive ===\n%4s\t%4s\t%7s\n","rest","iter","resnorm")
     log && reserve!(history, :resnorm, maxiter + 1)
 
     # Actually perform AAR
     iterable = aarn_iterator!(x, A, b, Pl, Pr; abstol = abstol, reltol = reltol, maxiter = maxiter,
-                            statevars = statevars, depth = depth, p = p, omega = omega, beta = beta, kwargs...)
+                            depth = depth, p = p, omega = omega, kwargs...)
     if log
         history.mvps = iterable.mv_products
     end
@@ -241,12 +207,12 @@ function aar_naive!(x, A, b;
             nextiter!(history, mvps = 1)
             push!(history, :resnorm, iterable.residual)
         end
-        verbose && @printf("%3d\t%1.2e\n", iteration, iterable.residual)
+        verbose && @printf("%s %3d\t%1.2e\n", iterable.state.ITER_TYPE, iteration, iterable.residual)
     end
 
     # Add final correction for right preconditioning
-    ldiv!(Pr, iterable.u)
-    x .= iterable.u
+    ldiv!(Pr, iterable.x)
+    x .= iterable.x
 
     verbose && println()
     log && setconv(history, converged(iterable))

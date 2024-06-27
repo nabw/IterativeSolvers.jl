@@ -192,6 +192,7 @@ function gmres!(x, A, b;
                 initially_zero::Bool = false,
                 verbose::Bool = false,
                 orth_meth::OrthogonalizationMethod = ModifiedGramSchmidt())
+    #@timeit "All" begin
     history = ConvergenceHistory(partial = !log, restart = restart)
     history[:abstol] = abstol
     history[:reltol] = reltol
@@ -219,6 +220,7 @@ function gmres!(x, A, b;
     log && shrink!(history)
 
     log ? (x, history) : x
+    #end # timeit All
 end
 
 function update_residual!(r::Residual, arnoldi::ArnoldiDecomp, k::Int)
