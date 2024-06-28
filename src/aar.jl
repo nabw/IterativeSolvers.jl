@@ -81,7 +81,7 @@ end
 function andersonStep!(it::AARIterable, mk::Int)
     #@timeit  "Anderson weights" begin
     # Anderson step, weights are updated here.
-    csne!(it.qr.R, it.F, it.r, it.work, it.work_depth, it.work_depth2, it.weights, it.qr.size)
+    csne!(it.qr.R, it.F, it.r, it.weights, it.work_depth, it.work_depth2, it.work_depth3, it.work, it.qr.size)
     #end #timeit "Anderson weights"
 
     #@timeit  "Anderson update" begin
@@ -90,7 +90,6 @@ function andersonStep!(it::AARIterable, mk::Int)
     mul!(it.x, it.X, it.weights, -1, 1)
     mul!(it.x, it.F, it.weights, -1, 1)
     #end #timeit "Anderson update"
-
 end
 
 ###############
