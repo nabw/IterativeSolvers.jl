@@ -3,6 +3,9 @@
 include("common.jl")
 include("orthogonalize.jl")
 
+#AAR
+include("aar.jl")
+
 # Hessenberg problem solver
 include("hessenberg.jl")
 
@@ -20,6 +23,7 @@ include("minres.jl")
 
 #GMRES
 include("gmres.jl")
+
 
 #IDRS
 include("idrs.jl")
